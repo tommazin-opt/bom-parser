@@ -110,11 +110,13 @@ FALLBACK_INTERNAL_PATTERN: Final[str] = r"^[A-Z]{1,4}\d{3,8}$"
 
 # Loose regex used to recognise "this token looks like a supplier part
 # number". Allowed characters: ASCII alphanumerics plus the punctuation
-# typically found inside MPNs (``-``, ``_``, ``.``, ``/``, ``#``). The
-# heuristic scorer in Stage 5 applies a much stricter, weighted check;
-# this one only needs to identify supplier rows during assembly.
+# typically found inside MPNs:
+#   ``-`` ``_`` ``.`` ``/`` ``#`` — common in industrial part codes
+#   ``"`` ``'``                   — dimensional notation (``60"``, ``5'``)
+# The heuristic scorer in Stage 5 applies a stricter weighted check; this
+# one only identifies supplier rows during assembly.
 PART_NUMBER_SHAPE_PATTERN: Final[str] = (
-    r"^[A-Za-z0-9][A-Za-z0-9._/#-]{2,30}$"
+    r"""^[A-Za-z0-9][A-Za-z0-9._/#"'-]{2,30}$"""
 )
 
 # Hierarchy depth marker at the start of a description-data line, e.g.
@@ -128,11 +130,18 @@ PART_NUMBER_SHAPE_PATTERN: Final[str] = (
 # still recognised.
 DEPTH_MARKER_PATTERN: Final[str] = r"^(?:\.{0,9})(\d{1,2})$"
 
-# Quantity-shaped token (BoM author writes them with 6 trailing zeros,
-# e.g. ``1.000000``, ``13.000000``). Used to *recognise* quantities so we
-# can pull them off description lines and avoid emitting them as
-# supplier-part candidates.
-QUANTITY_SHAPE_PATTERN: Final[str] = r"^\d+\.\d{4,}$"
+# Quantity-shaped token. The BoM author formats quantity values with a
+# right-padded zero string after the decimal point (``1.000000``,
+# ``13.000000``, ``0.500000``). The previous looser ``\d{4,}`` form
+# misfired on part numbers that happen to carry a decimal with four+
+# digits — for example, Lutze part ``763020.0220`` was being filtered
+# out as "quantity-shaped" and its supplier row lost.
+#
+# The new pattern requires the decimal segment to *end* with at least
+# three consecutive zeros, which all observed real quantity formats
+# satisfy and which non-quantity decimals like ``0220`` (ends in
+# ``220``) do not.
+QUANTITY_SHAPE_PATTERN: Final[str] = r"^\d+\.\d*0{3,}$"
 
 # Date-shaped tokens that should be stripped from description text.
 DATE_SHAPE_PATTERN: Final[str] = r"^\d{1,2}/\d{1,2}/\d{2,4}$"
@@ -156,19 +165,28 @@ DEFAULT_MIN_COMMODITY_LENGTH: Final[int] = 3
 # ---- Stage 5: heuristic scoring -------------------------------------------
 
 # Characters that disqualify a token from looking like a real supplier
-# part number. Quotes, commas, question / asterisk / semicolon / colon
-# are almost always extraction artefacts in this domain (description
+# part number. Commas, question / asterisk / semicolon / colon are
+# almost always extraction artefacts in this domain (description
 # fragments slipping into the mfg_part bbox, OCR garbage, etc.).
+#
+# Double and single quotes are *not* included: parts legitimately carry
+# dimensional notation like ``60"`` (inches) or ``5'`` (feet). The
+# stricter ``NAME_BAD_PUNCTUATION`` set below still excludes ``"`` to
+# catch description bleed in the supplier-name area.
 SCORING_BAD_PUNCTUATION: Final[frozenset[str]] = frozenset(
-    [",", '"', "'", "?", "*", ";", ":"]
+    [",", "?", "*", ";", ":"]
 )
 
 # Punctuation that legitimately appears inside MPNs and should not be
-# penalised (``-`` in ``596-00379``, ``/`` in ``B08-02-FL00``, ``.`` in
-# ``F919-0106-44-4X12.00.1-SS``, ``#`` in catalog codes, ``_`` in some
-# vendor schemes).
+# penalised. Examples:
+#   ``-`` in ``596-00379``
+#   ``/`` in ``B08-02-FL00``
+#   ``.`` in ``F919-0106-44-4X12.00.1-SS``
+#   ``#`` in catalog codes
+#   ``_`` in some vendor schemes
+#   ``"`` / ``'`` in dimensional notation (``60"``, ``5'``)
 SCORING_ALLOWED_PUNCTUATION: Final[frozenset[str]] = frozenset(
-    ["-", "_", "/", ".", "#"]
+    ["-", "_", "/", ".", "#", '"', "'"]
 )
 
 # Whitespace-penalty modulator. Multi-token supplier parts like
