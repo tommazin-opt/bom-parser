@@ -29,3 +29,6 @@ coverage.xml
 Thumbs.db
 
 .claude/
+
+Resources/BoMs/
+out/
