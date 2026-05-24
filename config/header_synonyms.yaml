@@ -1,0 +1,54 @@
+# Header synonyms for the canonical BoM columns.
+#
+# The layout detector (services/layout_detector.py) looks for any of these
+# phrases (case-insensitive, whitespace-collapsed) on each page's header
+# band. Adding a new BoM format usually means appending one or two
+# entries to the column whose label is unfamiliar.
+#
+# Mandatory canonical columns (parsing aborts if any are missing on a
+# page): part_identifier, description, mfg_name, mfg_part.
+
+part_identifier:
+  - "Part Identifier"
+  - "Part No"
+  - "Part Number"
+  - "Item No"
+  - "Item Number"
+  - "Component"
+
+description:
+  - "Description"
+  - "Desc"
+  - "Item Description"
+
+quantity:
+  - "Quantity"
+  - "Qty"
+  - "QTY"
+  - "Qty Req"
+
+uom:
+  - "UM"
+  - "U/M"
+  - "UoM"
+  - "Unit"
+
+mfg_name:
+  - "Mfg Name"
+  - "Manufacturer"
+  - "Vendor"
+  - "Supplier"
+
+mfg_part:
+  - "Mfg Part"
+  - "Manufacturer P/N"
+  - "Vendor PN"
+  - "Vendor P/N"
+  - "Supplier PN"
+  - "Supplier P/N"
+  - "MPN"
+
+commodity:
+  - "Commodity"
+  - "Category"
+  - "Class"

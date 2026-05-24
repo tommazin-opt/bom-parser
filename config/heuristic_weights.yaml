@@ -1,0 +1,24 @@
+# Heuristic scoring weights for supplier-part candidates.
+#
+# Defaults mirror plan §Stage 5 (revised). Edits here override the
+# ``HeuristicWeights`` defaults in ``models/scoring.py``; both must remain
+# in sync for the property-test invariants in tests/unit to hold.
+#
+# Token-shape signals (all-digits, all-letters, alnum mix) are
+# deliberately **absent** — per review they're neutral. Real MPNs are
+# common in every shape (``596-00379`` mixed, ``TM172PDG28R`` mixed,
+# ``5793T62`` mixed, ``5430`` digits-only at some vendors).
+
+length_min: 4
+length_max: 32
+length_in_range_reward: 0.50
+length_out_of_range_penalty: -0.40
+whitespace_penalty_per_char: -0.30
+lowercase_penalty: -0.10
+bad_punct_penalty_per_char: -0.20
+boundary_alnum_reward: 0.10
+
+# Drop candidates with confidence below this threshold (logged as
+# ``rejection_reason: below_min_confidence``). Tune by sweeping against
+# the golden fixtures in tests/integration.
+min_confidence: 0.35

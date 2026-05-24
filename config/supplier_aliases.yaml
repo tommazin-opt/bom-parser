@@ -1,0 +1,35 @@
+# Canonical supplier names with their known aliases.
+#
+# Top-level keys are the *canonical* names that get emitted in the output
+# JSON's ``suppliers[].name_normalized`` field. Each value is the list of
+# aliases (variants, abbreviations, brand-line names, OCR garble) that
+# should normalise to that canonical.
+#
+# Adding entries here is the supported way to teach the parser about a
+# new supplier or to fix a mis-clustering. The fuzzy fallback covers
+# most variants automatically; this file is for cases the fuzzy match
+# misses or gets wrong.
+
+"North Coast Components":
+  - "North Coast Com"
+  - "North Coast"
+  - "NCC"
+
+"McMaster-Carr":
+  - "McMaster"
+  - "Mcmaster"
+  - "McMaster- Carr"
+  - "Mcmaster- Carr"
+  - "Mcmaster-Carr"
+
+"Schneider Electric":
+  - "Modicon"          # Modicon is Schneider's PLC brand line
+
+"OMEGA Engineering":
+  - "OMEGA"
+  - "Omega"
+
+"U.S. Sensor":
+  - "U.S. Sensor"
+  - "US Sensor"
+  - "USS"
