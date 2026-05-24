@@ -21,7 +21,7 @@ from pathlib import Path
 
 from bom_parser.models.bom import BomDocument, ParseWarning
 from bom_parser.models.geometry import PageLayout
-from bom_parser.models.records import RawRecord
+from bom_parser.models.records import InProgressRecord, RawRecord
 from bom_parser.services.exporter import build_bom_document
 from bom_parser.services.heuristic_scorer import load_heuristic_weights
 from bom_parser.services.ingestion import ingest
@@ -30,7 +30,11 @@ from bom_parser.services.layout_detector import (
     detect_page_layout,
     load_header_synonyms,
 )
-from bom_parser.services.row_assembler import ParentTracker, assemble_records
+from bom_parser.services.row_assembler import (
+    ParentTracker,
+    assemble_records,
+    finalize_in_progress,
+)
 from bom_parser.services.supplier_normalizer import load_supplier_aliases
 from bom_parser.utils.consts import (
     CONFIG_DIR_NAME,
@@ -88,15 +92,24 @@ def parse_bom(
                 column_tokens.append(word.text)
     discovery = discover_internal_pattern(column_tokens)
 
-    # Row assembly — thread the ParentTracker across pages so a parent
-    # established on page N is visible to a child on page N+1.
+    # Row assembly — thread the ParentTracker AND the in-progress
+    # record across pages. The in-progress record handles the case
+    # where a part's supplier list spills onto the next page: those
+    # rows attach to the prior-page record instead of being dropped.
     parents = ParentTracker()
+    in_progress = InProgressRecord()
     all_records: list[RawRecord] = []
     for page, layout in zip(ingestion.pages, page_layouts):
-        page_records, parents = assemble_records(
-            page, layout, discovery.pattern, parents=parents
+        page_records, parents, in_progress = assemble_records(
+            page,
+            layout,
+            discovery.pattern,
+            parents=parents,
+            in_progress=in_progress,
         )
         all_records.extend(page_records)
+    trailing, parents = finalize_in_progress(in_progress, parents)
+    all_records.extend(trailing)
 
     return build_bom_document(
         tuple(all_records),

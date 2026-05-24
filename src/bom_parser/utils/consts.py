@@ -119,8 +119,14 @@ PART_NUMBER_SHAPE_PATTERN: Final[str] = (
 
 # Hierarchy depth marker at the start of a description-data line, e.g.
 # ``1`` (root child), ``.2`` (grandchild), ``..3`` (great-grandchild).
-# The captured digit is taken as the depth level.
-DEPTH_MARKER_PATTERN: Final[str] = r"^(?:\.{0,9})(\d+)\b"
+# The captured digit(s) are taken as the depth level. The ``$`` end
+# anchor is essential — without it the previous ``\b`` boundary form
+# matched ``80/20`` (the 80/20 Inc. supplier name) as a depth marker
+# (capturing "80"), which caused 80/20 supplier rows to be misclassified
+# as continuation lines and bleed into description text. Digit count is
+# deliberately unbounded so deep hierarchies (``..15``, ``...100``) are
+# still recognised.
+DEPTH_MARKER_PATTERN: Final[str] = r"^(?:\.{0,9})(\d{1,2})$"
 
 # Quantity-shaped token (BoM author writes them with 6 trailing zeros,
 # e.g. ``1.000000``, ``13.000000``). Used to *recognise* quantities so we

@@ -5,11 +5,19 @@ identifier, possibly nested under a parent record, possibly carrying
 several alternative ``SupplierRow``s. These flow into Stage 6
 (supplier normalisation) and Stage 7 (exporter) for grouping by
 description and emission to JSON.
+
+``InProgressRecord`` is the pipeline's *cross-page* state. When a
+record's supplier rows spill onto the next page, the partial state is
+captured here and threaded into the next ``assemble_records`` call so
+those overflowing suppliers attach to the prior-page record instead of
+landing in an orphan or being dropped.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from bom_parser.models.geometry import PageLayout, PhysicalLine
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,3 +61,28 @@ class RawRecord:
     suppliers: tuple[SupplierRow, ...]
     page_index: int
     line_y: float
+
+
+@dataclass(frozen=True, slots=True)
+class InProgressRecord:
+    """Cross-page record state — see module docstring.
+
+    All fields default to "no record in progress". The ``layout`` is
+    captured at record-start time so the finalisation pass uses the
+    columns from the page where the record began, even if the record's
+    body bleeds onto pages with (slightly) different layouts.
+    """
+
+    start: PhysicalLine | None = None
+    continuation: tuple[PhysicalLine, ...] = field(
+        default_factory=tuple[PhysicalLine, ...]
+    )
+    suppliers: tuple[SupplierRow, ...] = field(
+        default_factory=tuple[SupplierRow, ...]
+    )
+    page_index: int = -1
+    layout: PageLayout | None = None
+
+    @property
+    def is_active(self) -> bool:
+        return self.start is not None and self.layout is not None
