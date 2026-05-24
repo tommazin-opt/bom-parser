@@ -119,8 +119,14 @@ PART_NUMBER_SHAPE_PATTERN: Final[str] = (
 
 # Hierarchy depth marker at the start of a description-data line, e.g.
 # ``1`` (root child), ``.2`` (grandchild), ``..3`` (great-grandchild).
-# The captured digit is taken as the depth level.
-DEPTH_MARKER_PATTERN: Final[str] = r"^(?:\.{0,9})(\d+)\b"
+# The captured digit(s) are taken as the depth level. The ``$`` end
+# anchor is essential — without it the previous ``\b`` boundary form
+# matched ``80/20`` (the 80/20 Inc. supplier name) as a depth marker
+# (capturing "80"), which caused 80/20 supplier rows to be misclassified
+# as continuation lines and bleed into description text. Digit count is
+# deliberately unbounded so deep hierarchies (``..15``, ``...100``) are
+# still recognised.
+DEPTH_MARKER_PATTERN: Final[str] = r"^(?:\.{0,9})(\d{1,2})$"
 
 # Quantity-shaped token (BoM author writes them with 6 trailing zeros,
 # e.g. ``1.000000``, ``13.000000``). Used to *recognise* quantities so we
@@ -130,6 +136,14 @@ QUANTITY_SHAPE_PATTERN: Final[str] = r"^\d+\.\d{4,}$"
 
 # Date-shaped tokens that should be stripped from description text.
 DATE_SHAPE_PATTERN: Final[str] = r"^\d{1,2}/\d{1,2}/\d{2,4}$"
+
+# Fraction of the ``mfg_part`` band's own width used as the horizontal-gap
+# threshold when collecting multi-token supplier parts (``1010 X 36``,
+# ``DMP 331-110-...``). A consecutive-word gap larger than this is taken
+# to be an inter-column boundary and stops the rightward walk. The ratio
+# scales with the document's own column sizing, so the threshold stays
+# correct across BoM templates regardless of their absolute point sizes.
+SUPPLIER_PART_GAP_RATIO: Final[float] = 0.3
 
 # Minimum length for a token in the commodity band to be accepted as the
 # commodity code. The BoM's Rev / ECN / Alternate-Part flags are
@@ -155,6 +169,29 @@ SCORING_BAD_PUNCTUATION: Final[frozenset[str]] = frozenset(
 # vendor schemes).
 SCORING_ALLOWED_PUNCTUATION: Final[frozenset[str]] = frozenset(
     ["-", "_", "/", ".", "#"]
+)
+
+# Whitespace-penalty modulator. Multi-token supplier parts like
+# ``"1010 X 36"`` or ``"DMP 331-110-P001-4-5-TAO-"`` are legitimate, but
+# description fragments accidentally classified as supplier rows tend to
+# be multi-token AND messy. We compute the fraction of whitespace-split
+# sub-tokens that look "clean" (uppercase / digit-only / allowed-punct,
+# length >= 2, no bad punctuation). At or above this threshold, the
+# whitespace penalty is waived entirely. Below, it still applies — but
+# at the *reduced* per-space penalty in ``HeuristicWeights`` (so short
+# multi-token parts that don't quite reach 80% clean still pass with a
+# thin margin).
+SCORING_CLEAN_TOKEN_RATIO_THRESHOLD: Final[float] = 0.80
+
+# Characters that, if found inside a supplier-NAME word during Stage 3
+# classification, mark the line as description bleed rather than a real
+# supplier row. Curated subset of ``SCORING_BAD_PUNCTUATION``: the
+# apostrophe is excluded so legitimate names like ``"O'Brien Industries"``
+# or ``"McDonald's"`` are preserved. Description text in BoMs reliably
+# uses commas (between phrases) and double-quotes (for dimensions like
+# ``1/4"``); supplier names reliably don't.
+NAME_BAD_PUNCTUATION: Final[frozenset[str]] = frozenset(
+    [",", '"', "?", "*", ";", ":"]
 )
 
 

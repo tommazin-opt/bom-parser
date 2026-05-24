@@ -26,7 +26,7 @@ from bom_parser.models.geometry import (
 )
 from bom_parser.models.ingestion import IngestedDocument, IngestedPage
 from bom_parser.models.internal_pattern import InternalPatternDiscovery
-from bom_parser.models.records import RawRecord, SupplierRow
+from bom_parser.models.records import InProgressRecord, RawRecord, SupplierRow
 from bom_parser.models.scoring import HeuristicWeights, PartScoreResult
 
 __all__ = [
@@ -37,6 +37,7 @@ __all__ = [
     "HeuristicWeights",
     "IngestedDocument",
     "IngestedPage",
+    "InProgressRecord",
     "InternalPatternDiscovery",
     "Occurrence",
     "PageLayout",

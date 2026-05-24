@@ -35,16 +35,24 @@ from dataclasses import dataclass
 
 import regex
 
-from bom_parser.models.geometry import CanonicalColumn, PageLayout, PhysicalLine, Word
+from bom_parser.models.geometry import (
+    CanonicalColumn,
+    PageLayout,
+    PhysicalLine,
+    Word,
+    XSpan,
+)
 from bom_parser.models.ingestion import IngestedPage
-from bom_parser.models.records import RawRecord, SupplierRow
+from bom_parser.models.records import InProgressRecord, RawRecord, SupplierRow
 from bom_parser.services.line_grouping import group_into_physical_lines
 from bom_parser.utils.consts import (
     DATE_SHAPE_PATTERN,
     DEFAULT_MIN_COMMODITY_LENGTH,
     DEPTH_MARKER_PATTERN,
+    NAME_BAD_PUNCTUATION,
     PART_NUMBER_SHAPE_PATTERN,
     QUANTITY_SHAPE_PATTERN,
+    SUPPLIER_PART_GAP_RATIO,
 )
 
 _PART_NUMBER_SHAPE = regex.compile(PART_NUMBER_SHAPE_PATTERN)
@@ -81,21 +89,39 @@ def assemble_records(
     internal_pattern: regex.Pattern[str],
     *,
     parents: ParentTracker | None = None,
-) -> tuple[tuple[RawRecord, ...], ParentTracker]:
+    in_progress: InProgressRecord | None = None,
+) -> tuple[tuple[RawRecord, ...], ParentTracker, InProgressRecord]:
     """Walk one page's words and emit ``RawRecord``s.
 
-    Returns ``(records, parents_after_page)``. The caller threads the
-    tracker across pages so a parent chain established on page N is
-    still visible to records on page N+1.
+    Returns ``(records, parents_after_page, in_progress_after_page)``.
+    The caller threads both ``parents`` and ``in_progress`` across pages.
+
+    ``in_progress`` carries any record whose body is still open at the
+    end of the previous page — that is, no next-record sentinel has
+    been seen yet. Supplier rows or continuation lines appearing at the
+    top of *this* page therefore attach to the prior-page record
+    instead of being dropped.
+
+    The trailing in-progress record at the end of the document is *not*
+    finalised here — call :func:`finalize_in_progress` after the last
+    page to emit it.
     """
     parents = parents or ParentTracker()
+    in_progress = in_progress or InProgressRecord()
     lines = group_into_physical_lines(page.words)
     body_lines = tuple(ln for ln in lines if ln.y_top >= layout.body_y_top)
 
     records: list[RawRecord] = []
-    current_start: PhysicalLine | None = None
-    current_continuation: list[PhysicalLine] = []
-    current_suppliers: list[SupplierRow] = []
+    current_start: PhysicalLine | None = in_progress.start
+    current_continuation: list[PhysicalLine] = list(in_progress.continuation)
+    current_suppliers: list[SupplierRow] = list(in_progress.suppliers)
+    current_page_index: int = (
+        in_progress.page_index if in_progress.is_active else page.page_index
+    )
+    current_layout: PageLayout = (
+        in_progress.layout if in_progress.is_active and in_progress.layout is not None
+        else layout
+    )
 
     for line in body_lines:
         kind = _classify_line(line, layout, internal_pattern)
@@ -105,13 +131,15 @@ def assemble_records(
                     start=current_start,
                     continuation=current_continuation,
                     suppliers=current_suppliers,
-                    layout=layout,
+                    layout=current_layout,
                     parents=parents,
                 )
                 records.append(record)
             current_start = line
             current_continuation = []
             current_suppliers = []
+            current_page_index = page.page_index
+            current_layout = layout
         elif kind == "supplier_row" and current_start is not None:
             supplier = _supplier_row_from_line(line, layout, page.page_index)
             if supplier is not None:
@@ -121,16 +149,39 @@ def assemble_records(
         # else: pre-record-start body content (page-header repeat, …) — skip
 
     if current_start is not None:
-        record, parents = _finalize_record(
+        new_in_progress = InProgressRecord(
             start=current_start,
-            continuation=current_continuation,
-            suppliers=current_suppliers,
-            layout=layout,
-            parents=parents,
+            continuation=tuple(current_continuation),
+            suppliers=tuple(current_suppliers),
+            page_index=current_page_index,
+            layout=current_layout,
         )
-        records.append(record)
+    else:
+        new_in_progress = InProgressRecord()
 
-    return tuple(records), parents
+    return tuple(records), parents, new_in_progress
+
+
+def finalize_in_progress(
+    in_progress: InProgressRecord,
+    parents: ParentTracker,
+) -> tuple[tuple[RawRecord, ...], ParentTracker]:
+    """Emit the document's final record after the last page has been processed.
+
+    No-op when no record is in progress.
+    """
+    if not in_progress.is_active:
+        return (), parents
+    assert in_progress.start is not None  # for type narrowing
+    assert in_progress.layout is not None
+    record, parents = _finalize_record(
+        start=in_progress.start,
+        continuation=list(in_progress.continuation),
+        suppliers=list(in_progress.suppliers),
+        layout=in_progress.layout,
+        parents=parents,
+    )
+    return (record,), parents
 
 
 # ---- line classification ---------------------------------------------------
@@ -166,29 +217,113 @@ def _is_record_start(
 
 
 def _is_supplier_row(line: PhysicalLine, layout: PageLayout) -> bool:
-    """Rightmost token sits in mfg_part and matches the part-number shape."""
+    """Column-bbox-aware classifier — a line is a supplier row iff:
+
+    1. There's a part-shaped word in the ``mfg_part`` x-band (not
+       date / quantity / depth-marker shaped).
+    2. There's at least one word to the LEFT of that part word (the
+       supplier name).
+    3. The supplier name's leftmost word lands within (or just before)
+       the ``mfg_name`` column band — description continuations start
+       at depth-marker x-position which is well to the left of
+       mfg_name, so this check rejects them. Tolerance is half the
+       mfg_name band's own width, keeping the threshold relative to
+       the document's detected layout rather than absolute points.
+    4. No quantity-shaped token anywhere on the line (those indicate
+       a description-data row, not a supplier row).
+
+    Picking the *leftmost* part-shaped word in mfg_part (rather than
+    the rightmost) sidesteps trailing qualifiers like ``"(24)"`` or
+    ``"36"`` that often sit next to the real part number.
+    """
     if not line.words:
         return False
     mfg_part_band = layout.columns.get("mfg_part")
     if mfg_part_band is None:
         return False
-    rightmost = line.words[-1]
-    if not mfg_part_band.overlaps_bbox(rightmost.bbox):
+
+    part_word = _leftmost_part_shape_word_in_band(line.words, mfg_part_band)
+    if part_word is None:
         return False
-    if _PART_NUMBER_SHAPE.match(rightmost.text) is None:
+
+    name_words = [w for w in line.words if w.bbox.x0 < part_word.bbox.x0]
+    if not name_words:
         return False
-    # Must have non-depth-marker content to the left to be a real supplier row
-    leftward = line.words[:-1]
-    if not leftward:
+    if _DEPTH_MARKER.match(name_words[0].text) is not None:
         return False
-    if _DEPTH_MARKER.match(leftward[0].text) is not None:
-        return False
-    # And the line must not contain a quantity-shaped token (those are
-    # description-data rows, even if their rightmost word coincidentally
-    # lands in the mfg_part band).
     if any(_QUANTITY_SHAPE.match(w.text) for w in line.words):
         return False
+    if not _name_starts_in_mfg_name_band(name_words, layout):
+        return False
+    if not _name_has_no_description_chars(name_words):
+        return False
     return True
+
+
+def _name_has_no_description_chars(name_words: list[Word]) -> bool:
+    """Reject lines whose supplier-name area carries description punctuation.
+
+    Description continuations that start near the mfg_name x-position
+    (and so pass the leftmost-x sanity check) still give themselves
+    away by carrying chars that real supplier names don't use — commas
+    between description phrases, double-quotes for dimensional notation
+    (``1/4"``, ``8"LD``), etc. Real supplier names (``BD Sensors``,
+    ``OMEGA``, ``McMaster-Carr``, ``Bond FluidAire``, even apostrophe-
+    bearing ``O'Brien Industries``) avoid this set entirely.
+
+    The bad-char set is the curated ``NAME_BAD_PUNCTUATION`` in consts —
+    *not* the broader scoring set — so apostrophes survive.
+    """
+    for word in name_words:
+        for ch in word.text:
+            if ch in NAME_BAD_PUNCTUATION:
+                return False
+    return True
+
+
+def _name_starts_in_mfg_name_band(
+    name_words: list[Word], layout: PageLayout
+) -> bool:
+    """Reject lines whose leftmost word is far left of the mfg_name column.
+
+    Description continuations whose wrapped text happens to put an
+    alphanumeric token in the mfg_part band would otherwise be
+    misclassified as supplier rows — but their leftmost word sits at
+    the depth-marker x-position (well left of mfg_name).
+
+    The tolerance is half the mfg_name band's own width so the check
+    is relative to the document's detected layout (no hardcoded
+    points). When mfg_name isn't detected on this page, skip the
+    check rather than false-reject.
+    """
+    mfg_name_band = layout.columns.get("mfg_name")
+    if mfg_name_band is None:
+        return True
+    leftmost_x = min(w.bbox.x0 for w in name_words)
+    tolerance = mfg_name_band.width * 0.5
+    return leftmost_x + tolerance >= mfg_name_band.x_min
+
+
+def _leftmost_part_shape_word_in_band(
+    words: tuple[Word, ...], band: XSpan
+) -> Word | None:
+    """Find the leftmost word that (a) sits in ``band`` and (b) looks like
+    a supplier part number — passes the part-number shape and is not a
+    date- or quantity-shaped token."""
+    candidates: list[Word] = []
+    for word in words:
+        if not band.overlaps_bbox(word.bbox):
+            continue
+        if _PART_NUMBER_SHAPE.match(word.text) is None:
+            continue
+        if _DATE_SHAPE.match(word.text) is not None:
+            continue
+        if _QUANTITY_SHAPE.match(word.text) is not None:
+            continue
+        candidates.append(word)
+    if not candidates:
+        return None
+    return min(candidates, key=lambda w: w.bbox.x0)
 
 
 # ---- record finalisation ---------------------------------------------------
@@ -330,43 +465,73 @@ def _supplier_row_from_line(
     layout: PageLayout,
     page_index: int,
 ) -> SupplierRow | None:
-    """Build a ``SupplierRow`` from a supplier-classified line.
+    """Build a ``SupplierRow`` using the same column-bbox logic as the classifier.
 
-    The rightmost token is the supplier part. Everything to its left
-    (joined with spaces, with column-band-irrelevant words filtered) is
-    the supplier name.
+    The part text spans every word from the leftmost part-shaped word
+    in ``mfg_part`` rightward, stopping at the first horizontal gap
+    large enough to indicate the next column. This captures multi-
+    token parts like ``"1010 X 36"`` or ``"DMP 331-110-P001-4-5-TAO-"``
+    without committing to a hardcoded right edge for the column.
+
+    The name is every word to the LEFT of that leftmost part-shape
+    word, joined with spaces.
     """
     if not line.words:
         return None
-    part_word = line.words[-1]
-    name_words = line.words[:-1]
+    mfg_part_band = layout.columns.get("mfg_part")
+    if mfg_part_band is None:
+        return None
+    part_word = _leftmost_part_shape_word_in_band(line.words, mfg_part_band)
+    if part_word is None:
+        return None
+
+    name_words = tuple(w for w in line.words if w.bbox.x0 < part_word.bbox.x0)
     if not name_words:
         return None
-    name_text = _join_supplier_name(name_words, layout)
+    name_text = " ".join(w.text for w in name_words).strip()
     if not name_text:
         return None
+
+    part_text = _collect_part_text(line, part_word, mfg_part_band)
+    if not part_text:
+        return None
+
     return SupplierRow(
         name_text=name_text,
-        part_text=part_word.text,
+        part_text=part_text,
         page_index=page_index,
         line_y=line.y_top,
     )
 
 
-def _join_supplier_name(words: tuple[Word, ...], layout: PageLayout) -> str:
-    """Join words intended to be part of the supplier name.
+def _collect_part_text(
+    line: PhysicalLine,
+    part_word: Word,
+    mfg_part_band: XSpan,
+) -> str:
+    """Walk rightward from ``part_word``, collecting words until a
+    large horizontal gap signals the next column.
 
-    Drops any word that lands in the commodity column (in this BoM, a
-    commodity code sometimes trails on supplier rows when the description
-    word stream overruns).
+    Intra-part gaps between sub-tokens are tight (a few points), while
+    the gap between the part column and the next rightward column
+    (commodity, etc.) is much wider. The threshold is
+    ``mfg_part_band.width * SUPPLIER_PART_GAP_RATIO`` (default 0.3)
+    so the limit scales with the document's own column sizing — no
+    hardcoded points, generalises across BoM templates.
     """
-    commodity_band = layout.columns.get("commodity")
-    kept: list[str] = []
-    for w in words:
-        if commodity_band is not None and commodity_band.overlaps_bbox(w.bbox):
-            continue
-        kept.append(w.text)
-    return " ".join(kept).strip()
+    max_gap = mfg_part_band.width * SUPPLIER_PART_GAP_RATIO
+    rightward = sorted(
+        (w for w in line.words if w.bbox.x0 >= part_word.bbox.x0),
+        key=lambda w: w.bbox.x0,
+    )
+    collected: list[Word] = []
+    prev_x1: float | None = None
+    for word in rightward:
+        if prev_x1 is not None and (word.bbox.x0 - prev_x1) > max_gap:
+            break
+        collected.append(word)
+        prev_x1 = word.bbox.x1
+    return " ".join(w.text for w in collected).strip()
 
 
 # ---- small surface area for typing / external use ---- ---------------------
