@@ -46,6 +46,7 @@ from bom_parser.models.scoring import HeuristicWeights, PartScoreResult
 from bom_parser.utils.consts import (
     DATE_SHAPE_PATTERN,
     QUANTITY_SHAPE_PATTERN,
+    SCORING_ALLOWED_PUNCTUATION,
     SCORING_BAD_PUNCTUATION,
 )
 
@@ -116,7 +117,16 @@ def _weighted_confidence(token: str, *, weights: HeuristicWeights) -> float:
 
     space_count = sum(1 for ch in token if ch.isspace())
     if space_count:
-        score += weights.whitespace_penalty_per_char * space_count
+        # Multi-token parts are legitimate when most sub-tokens look
+        # like real part components. Only penalise whitespace when the
+        # clean-token ratio falls below the configured threshold
+        # (default 80%) — and even then, at the *reduced* per-space
+        # penalty so short multi-token parts still pass with a margin.
+        sub_tokens = token.split()
+        clean_count = sum(1 for t in sub_tokens if _is_clean_token(t))
+        clean_ratio = clean_count / len(sub_tokens) if sub_tokens else 1.0
+        if clean_ratio < weights.whitespace_clean_token_ratio_threshold:
+            score += weights.whitespace_penalty_per_char * space_count
 
     if any(ch.islower() for ch in token):
         score += weights.lowercase_penalty
@@ -137,6 +147,38 @@ def _weighted_confidence(token: str, *, weights: HeuristicWeights) -> float:
 
 def _is_alnum(ch: str) -> bool:
     return ch.isalnum() and ch.isascii()
+
+
+def _is_clean_token(token: str) -> bool:
+    """Whether a whitespace-split sub-token looks like a genuine part component.
+
+    Used by :func:`_weighted_confidence` to modulate the whitespace
+    penalty: legitimate dimensional fragments inside multi-token parts
+    (``"X"``, ``"HD"``, ``"36"``, ``"1010"``) are clean; description
+    words (``"flying"``, ``"lead"``, ``"2meter"``) are not.
+
+    Caller is expected to pass a non-empty sub-token from ``str.split()``
+    (which discards empty entries and never preserves whitespace).
+
+    Clean iff:
+      * no bad-punctuation chars (comma, quote, etc.)
+      * every char is alphanumeric or in the allowed-punct set
+      * not all-lowercase, not lowercase-with-digits — description text
+        gives itself away by having lowercase-only word shapes; real
+        part components are uppercase / pure-numeric / mixed-case
+    """
+    if not token:
+        return False
+    for ch in token:
+        if ch in SCORING_BAD_PUNCTUATION:
+            return False
+        if not (ch.isalnum() or ch in SCORING_ALLOWED_PUNCTUATION):
+            return False
+    has_upper = any(ch.isupper() for ch in token)
+    has_lower = any(ch.islower() for ch in token)
+    if has_lower and not has_upper:
+        return False
+    return True
 
 
 def load_heuristic_weights(path: str | Path) -> HeuristicWeights:

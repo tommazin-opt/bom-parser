@@ -49,8 +49,10 @@ from bom_parser.utils.consts import (
     DATE_SHAPE_PATTERN,
     DEFAULT_MIN_COMMODITY_LENGTH,
     DEPTH_MARKER_PATTERN,
+    NAME_BAD_PUNCTUATION,
     PART_NUMBER_SHAPE_PATTERN,
     QUANTITY_SHAPE_PATTERN,
+    SUPPLIER_PART_GAP_RATIO,
 )
 
 _PART_NUMBER_SHAPE = regex.compile(PART_NUMBER_SHAPE_PATTERN)
@@ -215,20 +217,24 @@ def _is_record_start(
 
 
 def _is_supplier_row(line: PhysicalLine, layout: PageLayout) -> bool:
-    """Column-bbox-aware classifier — a line is a supplier row iff it has:
+    """Column-bbox-aware classifier — a line is a supplier row iff:
 
-    1. At least one word in the ``mfg_part`` x-band whose text matches
-       the part-number shape (and is not date- or quantity-shaped).
-    2. At least one non-marker word to the LEFT of that part word (the
-       supplier name; may span multiple words and overflow leftward
-       through the mfg_name band into the description band).
-    3. No quantity-shaped token anywhere on the line (those indicate a
-       description-data row, not a supplier row).
+    1. There's a part-shaped word in the ``mfg_part`` x-band (not
+       date / quantity / depth-marker shaped).
+    2. There's at least one word to the LEFT of that part word (the
+       supplier name).
+    3. The supplier name's leftmost word lands within (or just before)
+       the ``mfg_name`` column band — description continuations start
+       at depth-marker x-position which is well to the left of
+       mfg_name, so this check rejects them. Tolerance is half the
+       mfg_name band's own width, keeping the threshold relative to
+       the document's detected layout rather than absolute points.
+    4. No quantity-shaped token anywhere on the line (those indicate
+       a description-data row, not a supplier row).
 
-    Crucially this does *not* require the rightmost word to be the part
-    number — the supplier-part column often carries a trailing qualifier
-    (``"(24)"``, ``"36"``) after the actual part number. Picking the
-    leftmost part-shaped word in the mfg_part band sidesteps that.
+    Picking the *leftmost* part-shaped word in mfg_part (rather than
+    the rightmost) sidesteps trailing qualifiers like ``"(24)"`` or
+    ``"36"`` that often sit next to the real part number.
     """
     if not line.words:
         return False
@@ -247,7 +253,55 @@ def _is_supplier_row(line: PhysicalLine, layout: PageLayout) -> bool:
         return False
     if any(_QUANTITY_SHAPE.match(w.text) for w in line.words):
         return False
+    if not _name_starts_in_mfg_name_band(name_words, layout):
+        return False
+    if not _name_has_no_description_chars(name_words):
+        return False
     return True
+
+
+def _name_has_no_description_chars(name_words: list[Word]) -> bool:
+    """Reject lines whose supplier-name area carries description punctuation.
+
+    Description continuations that start near the mfg_name x-position
+    (and so pass the leftmost-x sanity check) still give themselves
+    away by carrying chars that real supplier names don't use — commas
+    between description phrases, double-quotes for dimensional notation
+    (``1/4"``, ``8"LD``), etc. Real supplier names (``BD Sensors``,
+    ``OMEGA``, ``McMaster-Carr``, ``Bond FluidAire``, even apostrophe-
+    bearing ``O'Brien Industries``) avoid this set entirely.
+
+    The bad-char set is the curated ``NAME_BAD_PUNCTUATION`` in consts —
+    *not* the broader scoring set — so apostrophes survive.
+    """
+    for word in name_words:
+        for ch in word.text:
+            if ch in NAME_BAD_PUNCTUATION:
+                return False
+    return True
+
+
+def _name_starts_in_mfg_name_band(
+    name_words: list[Word], layout: PageLayout
+) -> bool:
+    """Reject lines whose leftmost word is far left of the mfg_name column.
+
+    Description continuations whose wrapped text happens to put an
+    alphanumeric token in the mfg_part band would otherwise be
+    misclassified as supplier rows — but their leftmost word sits at
+    the depth-marker x-position (well left of mfg_name).
+
+    The tolerance is half the mfg_name band's own width so the check
+    is relative to the document's detected layout (no hardcoded
+    points). When mfg_name isn't detected on this page, skip the
+    check rather than false-reject.
+    """
+    mfg_name_band = layout.columns.get("mfg_name")
+    if mfg_name_band is None:
+        return True
+    leftmost_x = min(w.bbox.x0 for w in name_words)
+    tolerance = mfg_name_band.width * 0.5
+    return leftmost_x + tolerance >= mfg_name_band.x_min
 
 
 def _leftmost_part_shape_word_in_band(
@@ -413,12 +467,14 @@ def _supplier_row_from_line(
 ) -> SupplierRow | None:
     """Build a ``SupplierRow`` using the same column-bbox logic as the classifier.
 
-    The part is the leftmost part-shaped word in the ``mfg_part`` band
-    (so a trailing qualifier like ``"(24)"`` or ``"36"`` next to the
-    real part doesn't get picked up as the part). The name is every
-    word to the *left* of that part word, joined with spaces — no
-    column-based filtering, because such filters are template-specific
-    and hurt generalisation to BoMs with different column layouts.
+    The part text spans every word from the leftmost part-shaped word
+    in ``mfg_part`` rightward, stopping at the first horizontal gap
+    large enough to indicate the next column. This captures multi-
+    token parts like ``"1010 X 36"`` or ``"DMP 331-110-P001-4-5-TAO-"``
+    without committing to a hardcoded right edge for the column.
+
+    The name is every word to the LEFT of that leftmost part-shape
+    word, joined with spaces.
     """
     if not line.words:
         return None
@@ -435,12 +491,47 @@ def _supplier_row_from_line(
     name_text = " ".join(w.text for w in name_words).strip()
     if not name_text:
         return None
+
+    part_text = _collect_part_text(line, part_word, mfg_part_band)
+    if not part_text:
+        return None
+
     return SupplierRow(
         name_text=name_text,
-        part_text=part_word.text,
+        part_text=part_text,
         page_index=page_index,
         line_y=line.y_top,
     )
+
+
+def _collect_part_text(
+    line: PhysicalLine,
+    part_word: Word,
+    mfg_part_band: XSpan,
+) -> str:
+    """Walk rightward from ``part_word``, collecting words until a
+    large horizontal gap signals the next column.
+
+    Intra-part gaps between sub-tokens are tight (a few points), while
+    the gap between the part column and the next rightward column
+    (commodity, etc.) is much wider. The threshold is
+    ``mfg_part_band.width * SUPPLIER_PART_GAP_RATIO`` (default 0.3)
+    so the limit scales with the document's own column sizing — no
+    hardcoded points, generalises across BoM templates.
+    """
+    max_gap = mfg_part_band.width * SUPPLIER_PART_GAP_RATIO
+    rightward = sorted(
+        (w for w in line.words if w.bbox.x0 >= part_word.bbox.x0),
+        key=lambda w: w.bbox.x0,
+    )
+    collected: list[Word] = []
+    prev_x1: float | None = None
+    for word in rightward:
+        if prev_x1 is not None and (word.bbox.x0 - prev_x1) > max_gap:
+            break
+        collected.append(word)
+        prev_x1 = word.bbox.x1
+    return " ".join(w.text for w in collected).strip()
 
 
 # ---- small surface area for typing / external use ---- ---------------------

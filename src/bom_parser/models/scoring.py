@@ -22,13 +22,27 @@ from bom_parser.models.bom import RejectionReason
 
 @dataclass(frozen=True, slots=True)
 class HeuristicWeights:
-    """Scoring weights and threshold for supplier-part candidates."""
+    """Scoring weights and threshold for supplier-part candidates.
+
+    The whitespace penalty is *modulated* by the clean-token ratio of
+    the candidate. Multi-token parts like ``"1010 X 36"`` or
+    ``"DMP 331-110-P001-4-5-TAO-"`` are legitimate; the penalty is
+    waived when at least
+    ``whitespace_clean_token_ratio_threshold`` of the whitespace-split
+    sub-tokens look like genuine part components (uppercase / digit /
+    allowed-punct, length >= 2, no bad punct). Below the threshold —
+    e.g. ``"1010 X 36"`` which scores 67% because the single-letter
+    ``X`` doesn't count as clean — the penalty still applies but at
+    a *reduced* magnitude so short multi-token parts still pass with
+    a thin margin.
+    """
 
     length_min: int = 4
     length_max: int = 32
     length_in_range_reward: float = 0.50
     length_out_of_range_penalty: float = -0.40
-    whitespace_penalty_per_char: float = -0.30
+    whitespace_penalty_per_char: float = -0.10
+    whitespace_clean_token_ratio_threshold: float = 0.80
     lowercase_penalty: float = -0.10
     bad_punct_penalty_per_char: float = -0.20
     boundary_alnum_reward: float = 0.10
