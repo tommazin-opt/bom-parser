@@ -13,7 +13,9 @@ Invocation (from project root):
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Iterator
 from pathlib import Path
+from typing import Any
 
 from bom_parser.pipeline import parse_bom
 from bom_parser.utils.consts import (
@@ -32,6 +34,13 @@ PDFS_TO_GOLDEN: dict[str, str] = {
 }
 
 
+def _walk(nodes: Iterable[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+    """Yield every node dict in a serialized part tree (pre-order DFS)."""
+    for node in nodes:
+        yield node
+        yield from _walk(node.get("children", []))
+
+
 def main() -> None:
     GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
     boms_dir = PROJECT_ROOT / RESOURCES_DIR_NAME / BOMS_DIR_NAME
@@ -44,8 +53,9 @@ def main() -> None:
         (GOLDEN_DIR / golden_name).write_text(
             json.dumps(data, indent=2), encoding="utf-8"
         )
-        n_parts = len(data["parts"])
-        n_pairs = sum(len(p["suppliers"]) for p in data["parts"])
+        nodes = list(_walk(data["parts"]))
+        n_parts = len(nodes)
+        n_pairs = sum(len(n["suppliers"]) for n in nodes)
         print(f"wrote {golden_name}: {n_parts} parts, {n_pairs} supplier-part pairs")
 
 

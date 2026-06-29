@@ -146,6 +146,16 @@ QUANTITY_SHAPE_PATTERN: Final[str] = r"^\d+\.\d*0{3,}$"
 # Date-shaped tokens that should be stripped from description text.
 DATE_SHAPE_PATTERN: Final[str] = r"^\d{1,2}/\d{1,2}/\d{2,4}$"
 
+# Trailing parenthetical on a supplier part that is a *packaging / quantity*
+# annotation rather than part of the MPN — e.g. "(PACK OF 5)", "(5 PACK)",
+# "(QTY 10)". These are stripped from the collected part text; all other
+# parentheticals (notably length suffixes like "(36)" / "(24)" on extrusion
+# part numbers) are preserved. Matched case-insensitively against the joined
+# parenthetical group.
+PACKAGING_ANNOTATION_PATTERN: Final[str] = (
+    r"^\((?:pack\s+of\s+\d+|\d+\s+pack|qty\.?\s*\d+)\)$"
+)
+
 # Fraction of the ``mfg_part`` band's own width used as the horizontal-gap
 # threshold when collecting multi-token supplier parts (``1010 X 36``,
 # ``DMP 331-110-...``). A consecutive-word gap larger than this is taken
@@ -237,3 +247,16 @@ SUPPLIER_TRAILING_PUNCT: Final[str] = ".,;:!?"
 # codes, and single digits — the shapes those flag fields take on
 # the reference docs.
 FLAG_TOKEN_PATTERN: Final[str] = r"^(?:[A-Z]{1,2}|\d)$"
+
+# Running page-footer signature. The BoM prints a footer block at the bottom
+# of every page — "* Current Alternate BOM Code / Bill of Materials -
+# Explosion/Implosion Reports, BOMRPT.RPT Opti Temp Inc SSzot <date> <time>".
+# Any physical line whose joined text contains one of these markers is footer
+# furniture and must not be folded into the last record on the page. Markers
+# are chosen to be unique to the footer (a report filename and the report
+# title) so legitimate part descriptions never match.
+FOOTER_LINE_MARKERS: Final[tuple[str, ...]] = (
+    "BOMRPT",
+    "Explosion/Implosion",
+    "Alternate BOM Code",
+)

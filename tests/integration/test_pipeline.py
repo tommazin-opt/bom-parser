@@ -14,6 +14,7 @@ import regex
 
 from bom_parser.models.bom import BomDocument
 from bom_parser.pipeline import parse_bom
+from bom_parser.services.tree_builder import iter_nodes
 
 
 @pytest.fixture(scope="session")
@@ -38,7 +39,7 @@ def parsed(request: pytest.FixtureRequest) -> BomDocument:
 
 
 def test_emits_at_least_one_supplier_part_pair(parsed: BomDocument) -> None:
-    total_pairs = sum(len(p.suppliers) for p in parsed.parts)
+    total_pairs = sum(len(n.suppliers) for n in iter_nodes(parsed.parts))
     assert total_pairs > 0, (
         "Catastrophic regression: parser produced zero supplier-part pairs"
     )
@@ -46,7 +47,7 @@ def test_emits_at_least_one_supplier_part_pair(parsed: BomDocument) -> None:
 
 def test_emits_multiple_parts(parsed: BomDocument) -> None:
     """Reference BoMs each have well over 100 parts."""
-    assert len(parsed.parts) > 50
+    assert sum(1 for _ in iter_nodes(parsed.parts)) > 50
 
 
 # ---- Plan §Verification 3: internal-pattern correctness -------------------
@@ -97,7 +98,7 @@ def test_supplier_parts_matching_internal_pattern_are_flagged(
     """
     pattern = regex.compile(parsed.metadata.discovered_internal_pattern)
     mismatches: list[str] = []
-    for part in parsed.parts:
+    for part in iter_nodes(parsed.parts):
         for supplier in part.suppliers:
             if pattern.match(supplier.part_number) is None:
                 continue
@@ -129,7 +130,7 @@ def test_metadata_has_required_fields(parsed: BomDocument) -> None:
 def test_each_supplier_part_pair_has_confidence_in_range(
     parsed: BomDocument,
 ) -> None:
-    for part in parsed.parts:
+    for part in iter_nodes(parsed.parts):
         for supplier in part.suppliers:
             assert 0.0 <= supplier.confidence_score <= 1.0
 
@@ -146,7 +147,7 @@ def test_north_coast_variants_normalize_to_one_canonical_456(
     emitted JSON — that's the headline §Verification 6 assertion.
     """
     raw_to_canonical: dict[str, str] = {}
-    for part in parsed_456.parts:
+    for part in iter_nodes(parsed_456.parts):
         for supplier in part.suppliers:
             raw = supplier.name_raw
             if raw in {"NCC", "North Coast", "North Coast Com"}:
@@ -167,7 +168,7 @@ def test_north_coast_variants_normalize_to_one_canonical_456(
 def test_specific_supplier_pair_present_456(parsed_456: BomDocument) -> None:
     """The danger-label group must list North Coast Components 596-00379."""
     found = False
-    for part in parsed_456.parts:
+    for part in iter_nodes(parsed_456.parts):
         for supplier in part.suppliers:
             if supplier.part_number == "596-00379":
                 assert "North Coast" in supplier.name_normalized

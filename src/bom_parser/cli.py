@@ -29,6 +29,7 @@ from bom_parser.services.layout_detector import (
     detect_page_layout,
     load_header_synonyms,
 )
+from bom_parser.services.tree_builder import iter_nodes
 from bom_parser.utils.consts import CONFIG_DIR_NAME, HEADER_SYNONYMS_FILENAME
 from bom_parser.utils.discovery import discover_bom_pdfs
 
@@ -67,8 +68,9 @@ def parse_cmd(
     document = parse_bom(pdf, config_dir=config)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(document.model_dump_json(indent=2), encoding="utf-8")
+    node_count = sum(1 for _ in iter_nodes(document.parts))
     console.print(
-        f"[green]Wrote {len(document.parts)} parts to {output}[/green]"
+        f"[green]Wrote {node_count} parts to {output}[/green]"
     )
     if document.metadata.warnings:
         console.print(
@@ -105,9 +107,10 @@ def batch_cmd(
         document = parse_bom(pdf, config_dir=config)
         target = output_dir / f"{pdf.stem}.json"
         target.write_text(document.model_dump_json(indent=2), encoding="utf-8")
+        node_count = sum(1 for _ in iter_nodes(document.parts))
         console.print(
             f"  {pdf.name} -> {target.name}  "
-            f"({len(document.parts)} parts, "
+            f"({node_count} parts, "
             f"{len(document.metadata.warnings)} warning(s))"
         )
 
@@ -179,33 +182,39 @@ def summary_cmd(
         help="Truncate descriptions longer than this many characters.",
     ),
 ) -> None:
-    """Print one line per internal-part occurrence for manual PDF cross-check.
+    """Print one line per tree node for manual PDF cross-check.
 
     Format: ``<internal_id> [(parent=<parent_id>)]  |  <description>  |  <suppliers>``
     where ``<suppliers>`` is ``Name1 PartNum1; Name2 PartNum2; ...`` or ``(none)``.
 
-    Each occurrence in the source BoM produces one line, so the output
-    can be scrolled side-by-side with the PDF.
+    Each node in the explosion tree produces one line (a part consumed under
+    several parents appears once per parent), so the output can be scrolled
+    side-by-side with the PDF.
     """
     data: dict[str, Any] = json.loads(json_path.read_text(encoding="utf-8"))
-    for part in data.get("parts", []):
-        desc = part.get("description", "")
+
+    def walk(node: dict[str, Any]) -> None:
+        desc = node.get("description", "")
         if len(desc) > desc_width:
             desc = desc[: desc_width - 3] + "..."
-        suppliers = part.get("suppliers", [])
+        suppliers = node.get("suppliers", [])
         if suppliers:
             suppliers_str = "; ".join(
                 f"{s['name_normalized']} {s['part_number']}" for s in suppliers
             )
         else:
             suppliers_str = "(none)"
-        for occ in part.get("occurrences", []):
-            parent = occ.get("parent_internal_part")
-            parent_str = f" (parent={parent})" if parent else ""
-            # plain print so output is pipe-friendly (no Rich ANSI codes)
-            print(
-                f"{occ['internal_author_part']}{parent_str}  |  {desc}  |  {suppliers_str}"
-            )
+        parent = node.get("parent_internal_part")
+        parent_str = f" (parent={parent})" if parent else ""
+        # plain print so output is pipe-friendly (no Rich ANSI codes)
+        print(
+            f"{node['internal_author_part']}{parent_str}  |  {desc}  |  {suppliers_str}"
+        )
+        for child in node.get("children", []):
+            walk(child)
+
+    for root in data.get("parts", []):
+        walk(root)
 
 
 if __name__ == "__main__":

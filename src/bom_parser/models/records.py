@@ -61,6 +61,7 @@ class RawRecord:
     suppliers: tuple[SupplierRow, ...]
     page_index: int
     line_y: float
+    description_truncated: bool = False
 
 
 @dataclass(frozen=True, slots=True)

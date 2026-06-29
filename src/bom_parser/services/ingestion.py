@@ -98,10 +98,18 @@ def _ingest_page(
     min_words_for_text_layer: int,
     warnings: list[ParseWarning],
 ) -> IngestedPage:
+    # ``use_text_flow=True`` groups characters into words following the PDF's
+    # text-rendering (content-stream) order rather than spatial x-sorting. On
+    # this template the effectivity-date column is *overprinted* on the
+    # description's exact baseline; spatial sorting interleaves the two runs
+    # char-by-char into garbage (``Elec.4"`` / ``/P1o8/2024``). Draw order keeps
+    # them as separate words (``Elec."``, ``Po``, ``4/18/2024``), so the date
+    # becomes a clean token the description filter can drop. Normal rows draw in
+    # spatial order, so supplier-name / part-number words are unaffected.
     raw_words = plumber_page.extract_words(
         extra_attrs=[PLUMBER_FONTNAME_ATTR, PLUMBER_SIZE_ATTR],
         keep_blank_chars=False,
-        use_text_flow=False,
+        use_text_flow=True,
         x_tolerance=x_tolerance,
         y_tolerance=y_tolerance,
     )

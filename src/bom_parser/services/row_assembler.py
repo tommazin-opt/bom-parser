@@ -49,7 +49,9 @@ from bom_parser.utils.consts import (
     DATE_SHAPE_PATTERN,
     DEFAULT_MIN_COMMODITY_LENGTH,
     DEPTH_MARKER_PATTERN,
+    FOOTER_LINE_MARKERS,
     NAME_BAD_PUNCTUATION,
+    PACKAGING_ANNOTATION_PATTERN,
     PART_NUMBER_SHAPE_PATTERN,
     QUANTITY_SHAPE_PATTERN,
     SUPPLIER_PART_GAP_RATIO,
@@ -59,6 +61,18 @@ _PART_NUMBER_SHAPE = regex.compile(PART_NUMBER_SHAPE_PATTERN)
 _DEPTH_MARKER = regex.compile(DEPTH_MARKER_PATTERN)
 _QUANTITY_SHAPE = regex.compile(QUANTITY_SHAPE_PATTERN)
 _DATE_SHAPE = regex.compile(DATE_SHAPE_PATTERN)
+_PACKAGING_ANNOTATION = regex.compile(
+    PACKAGING_ANNOTATION_PATTERN, regex.IGNORECASE
+)
+# Leading part-number label that some vendors prepend to the mfg-part value
+# ("PN:30M-BC-SS-10", "P/N: 1234"). The trailing colon is required so genuine
+# MPNs that merely start with "PN" (e.g. "PN1234") are not stripped.
+_PART_LABEL_PREFIX = regex.compile(r"^(?:P/?N|MPN|PART\s*#?)\s*:\s*", regex.IGNORECASE)
+
+
+def _strip_part_label(text: str) -> str:
+    """Remove a leading ``PN:`` / ``P/N:`` / ``MPN:`` label from a part token."""
+    return _PART_LABEL_PREFIX.sub("", text, count=1)
 
 # Single-letter UoM codes the reference BoMs use ("U", "EA", "FT").
 # Not in consts.py because they're a *recognition* heuristic specific to
@@ -109,7 +123,11 @@ def assemble_records(
     parents = parents or ParentTracker()
     in_progress = in_progress or InProgressRecord()
     lines = group_into_physical_lines(page.words)
-    body_lines = tuple(ln for ln in lines if ln.y_top >= layout.body_y_top)
+    body_lines = tuple(
+        ln
+        for ln in lines
+        if ln.y_top >= layout.body_y_top and not _is_footer_line(ln)
+    )
 
     records: list[RawRecord] = []
     current_start: PhysicalLine | None = in_progress.start
@@ -144,6 +162,8 @@ def assemble_records(
             supplier = _supplier_row_from_line(line, layout, page.page_index)
             if supplier is not None:
                 current_suppliers.append(supplier)
+        elif kind == "drawing_number":
+            continue  # Drawing#-column spillover — neither description nor supplier
         elif current_start is not None:
             current_continuation.append(line)
         # else: pre-record-start body content (page-header repeat, …) — skip
@@ -187,6 +207,19 @@ def finalize_in_progress(
 # ---- line classification ---------------------------------------------------
 
 
+def _is_footer_line(line: PhysicalLine) -> bool:
+    """Whether ``line`` is part of the repeating page-footer block.
+
+    The footer ("* Current Alternate BOM Code / Bill of Materials -
+    Explosion/Implosion Reports, BOMRPT.RPT Opti Temp Inc SSzot …") sits at the
+    bottom of every page and would otherwise be folded into the last record's
+    description. Matched on markers unique to the footer so real descriptions
+    never trip it.
+    """
+    joined = " ".join(w.text for w in line.words)
+    return any(marker in joined for marker in FOOTER_LINE_MARKERS)
+
+
 def _classify_line(
     line: PhysicalLine,
     layout: PageLayout,
@@ -196,7 +229,33 @@ def _classify_line(
         return "record_start"
     if _is_supplier_row(line, layout):
         return "supplier_row"
+    if _is_drawing_number_line(line, layout):
+        return "drawing_number"
     return "continuation"
+
+
+def _is_drawing_number_line(line: PhysicalLine, layout: PageLayout) -> bool:
+    """Whether ``line`` is a lone Drawing#-column value with no supplier name.
+
+    The Drawing# column can wrap to the top of the next page ahead of its
+    supplier row (FI000101: a bare ``30M-BC-SS-10`` precedes
+    ``Servapure PN:30M-BC-SS-10``). Such a line has a part-shaped token in the
+    ``mfg_part`` band but **nothing to its left** — distinguishing it from a
+    supplier row (which has a name) and from a description continuation (whose
+    words start far left). It must be dropped, not folded into the description.
+    """
+    if not line.words:
+        return False
+    if _line_has_commodity_token(line, layout):
+        return False
+    mfg_part_band = layout.columns.get("mfg_part")
+    if mfg_part_band is None:
+        return False
+    part_word = _leftmost_part_shape_word_in_band(line.words, mfg_part_band)
+    if part_word is None:
+        return False
+    name_words = [w for w in line.words if w.bbox.x0 < part_word.bbox.x0]
+    return not name_words
 
 
 def _is_record_start(
@@ -235,8 +294,17 @@ def _is_supplier_row(line: PhysicalLine, layout: PageLayout) -> bool:
     Picking the *leftmost* part-shaped word in mfg_part (rather than
     the rightmost) sidesteps trailing qualifiers like ``"(24)"`` or
     ``"36"`` that often sit next to the real part number.
+
+    A line carrying a commodity-band token is the description's wrap line
+    (desc-line-2 ends with the commodity, e.g. ``… Tooth Lock Washer FITT``).
+    Its description words can spill into the mfg_part x-band and otherwise look
+    like a supplier row — but it is never one. Forcing such lines to
+    ``continuation`` keeps the commodity (so ``_extract_commodity`` finds it)
+    and prevents a phantom vendor.
     """
     if not line.words:
+        return False
+    if _line_has_commodity_token(line, layout):
         return False
     mfg_part_band = layout.columns.get("mfg_part")
     if mfg_part_band is None:
@@ -309,16 +377,21 @@ def _leftmost_part_shape_word_in_band(
 ) -> Word | None:
     """Find the leftmost word that (a) sits in ``band`` and (b) looks like
     a supplier part number — passes the part-number shape and is not a
-    date- or quantity-shaped token."""
+    date- or quantity-shaped token.
+
+    Matching is done against the label-stripped text so ``PN:30M-BC-SS-10``
+    is recognised as the part ``30M-BC-SS-10``.
+    """
     candidates: list[Word] = []
     for word in words:
         if not band.overlaps_bbox(word.bbox):
             continue
-        if _PART_NUMBER_SHAPE.match(word.text) is None:
+        candidate_text = _strip_part_label(word.text)
+        if _PART_NUMBER_SHAPE.match(candidate_text) is None:
             continue
-        if _DATE_SHAPE.match(word.text) is not None:
+        if _DATE_SHAPE.match(candidate_text) is not None:
             continue
-        if _QUANTITY_SHAPE.match(word.text) is not None:
+        if _QUANTITY_SHAPE.match(candidate_text) is not None:
             continue
         candidates.append(word)
     if not candidates:
@@ -344,10 +417,12 @@ def _finalize_record(
     parent_internal = parents.parent_of(depth)
     new_parents = parents.push(depth, internal_part)
 
-    description = _join_description(continuation)
+    description = _join_description(continuation, layout)
     quantity = _extract_quantity(continuation, layout)
     uom = _extract_uom(continuation, layout)
     commodity = _extract_commodity(continuation, layout)
+    description = _strip_trailing_uom(description, uom, commodity)
+    description_truncated = _detect_truncation(continuation)
 
     record = RawRecord(
         internal_part=internal_part,
@@ -357,6 +432,7 @@ def _finalize_record(
         commodity=commodity,
         depth=depth,
         parent_internal_part=parent_internal,
+        description_truncated=description_truncated,
         suppliers=tuple(suppliers),
         page_index=page_index,
         line_y=start.y_top,
@@ -375,21 +451,120 @@ def _extract_depth(continuation: list[PhysicalLine]) -> int:
     return 0  # root level (no marker)
 
 
-def _join_description(continuation: list[PhysicalLine]) -> str:
-    """Concatenate description text across continuation lines, skipping noise."""
+def _join_description(
+    continuation: list[PhysicalLine], layout: PageLayout
+) -> str:
+    """Concatenate description text across continuation lines, skipping noise.
+
+    Bound the text to the description *body* region: words whose x-centre sits
+    at or right of the ``quantity`` band's left edge belong to the quantity /
+    UoM / flag (``U EA 0 N 0 AA A``) / commodity columns, not the description,
+    and are excluded. (Column bands are header-derived and don't tightly fit
+    the body, but the quantity band's left edge is a reliable right boundary for
+    the description text on this template.) The dimensional ``X`` separator and
+    the date token both fall left of that boundary; the date is dropped by its
+    own shape filter, the ``X`` is kept.
+    """
+    quantity_band = layout.columns.get("quantity")
     pieces: list[str] = []
+    prev_ran_into_date = False
     for line in continuation:
+        date_token = next(
+            (w for w in line.words if _DATE_SHAPE.match(w.text) is not None), None
+        )
+        kept: list[Word] = []
         for word in line.words:
             text = word.text
-            if _DEPTH_MARKER.match(text) is not None and not pieces:
+            if quantity_band is not None and word.bbox.x_center >= quantity_band.x_min:
+                continue
+            if _DEPTH_MARKER.match(text) is not None and not pieces and not kept:
                 # Skip the leading depth marker on the first data line.
                 continue
             if _QUANTITY_SHAPE.match(text):
                 continue
             if _DATE_SHAPE.match(text):
                 continue
-            pieces.append(text)
+            kept.append(word)
+        for position, word in enumerate(kept):
+            if (
+                position == 0
+                and pieces
+                and prev_ran_into_date
+                and len(pieces[-1]) >= 3
+                and _is_wrap_fragment(word.text)
+            ):
+                # The previous line's text ran into the date column and this
+                # line opens with a 1–2-char lowercase fragment: a word that
+                # wrapped mid-token (``Filte`` | ``r`` -> ``Filter``). Rejoin
+                # without a space. The ``>= 3`` head guard keeps this to genuine
+                # word-wraps and off date-clipped single-letter stubs ("A" | "c").
+                pieces[-1] = pieces[-1] + word.text
+            else:
+                pieces.append(word.text)
+        prev_ran_into_date = bool(
+            kept and date_token is not None and kept[-1].bbox.x1 > date_token.bbox.x0
+        )
     return " ".join(pieces).strip()
+
+
+def _is_wrap_fragment(text: str) -> bool:
+    """A 1–2 character lowercase-alpha token — the tail of a mid-wrapped word."""
+    return 1 <= len(text) <= 2 and text.isalpha() and text.islower()
+
+
+def _detect_truncation(continuation: list[PhysicalLine]) -> bool:
+    """Flag descriptions clipped by the overprinted effectivity date.
+
+    On this template the date is drawn *on top of* the description baseline; if
+    the description text runs into the date column, the date overprints (clips)
+    its tail, and those characters are not in the text layer (e.g. "Populated"
+    survives only as "Po"). Detection is geometric and makes no attempt to
+    recover the lost text: on a description line, take the rightmost non-date
+    token that x-overlaps the (stripped) date token; if its left edge sits at or
+    right of the date column's start — within ~2 character widths — the visible
+    text *begins inside* the date column, the signature of a clipped tail. A
+    complete word whose body sits left of the date column (its tail merely
+    overdrawn) is not flagged.
+    """
+    for line in continuation:
+        dates = [w for w in line.words if _DATE_SHAPE.match(w.text) is not None]
+        for date in dates:
+            char_width = (date.bbox.x1 - date.bbox.x0) / max(len(date.text), 1)
+            tolerance = 2.0 * char_width
+            overlapping = [
+                w
+                for w in line.words
+                if _DATE_SHAPE.match(w.text) is None
+                and w.bbox.x0 < date.bbox.x1
+                and w.bbox.x1 > date.bbox.x0
+            ]
+            if not overlapping:
+                continue
+            rightmost = max(overlapping, key=lambda w: w.bbox.x1)
+            if rightmost.bbox.x0 >= date.bbox.x0 - tolerance:
+                return True
+    return False
+
+
+def _strip_trailing_uom(
+    description: str, uom: str | None, commodity: str | None
+) -> str:
+    """Drop a duplicated unit-of-measure token left at the description's end.
+
+    On label rows the desc-line-2 layout is ``<dims>, VINYL, EA HDWARE`` — a
+    stray ``EA`` sits in the description x-band just before the commodity,
+    distinct from the real UoM column and the (correctly parsed) commodity.
+    We strip it only when it is a UoM-set token that *equals the record's own
+    parsed UoM* and a commodity is present, so genuine trailing text (a "5 FT"
+    dimension, or ``add EL000514``) is never touched.
+    """
+    if commodity is None or uom is None or not description:
+        return description
+    tokens = description.split()
+    last = tokens[-1]
+    if last == uom and _UOM_TOKEN.match(last) is not None:
+        return " ".join(tokens[:-1]).strip()
+    return description
 
 
 def _extract_quantity(
@@ -434,6 +609,23 @@ def _extract_uom(
     return candidates[0] if candidates else None
 
 
+def _is_commodity_token(word: Word, band: XSpan) -> bool:
+    """An uppercase, alphabetic token of commodity length sitting in ``band``."""
+    if not word.text.isalpha() or not word.text.isupper():
+        return False
+    if len(word.text) < DEFAULT_MIN_COMMODITY_LENGTH:
+        return False
+    return band.overlaps_bbox(word.bbox)
+
+
+def _line_has_commodity_token(line: PhysicalLine, layout: PageLayout) -> bool:
+    """Whether ``line`` carries a commodity-band token (its desc-line-2 marker)."""
+    band = layout.columns.get("commodity")
+    if band is None:
+        return False
+    return any(_is_commodity_token(w, band) for w in line.words)
+
+
 def _extract_commodity(
     continuation: list[PhysicalLine], layout: PageLayout
 ) -> str | None:
@@ -441,15 +633,12 @@ def _extract_commodity(
     band = layout.columns.get("commodity")
     if band is None:
         return None
-    found: list[Word] = []
-    for line in continuation:
-        for word in line.words:
-            if not word.text.isalpha() or not word.text.isupper():
-                continue
-            if len(word.text) < DEFAULT_MIN_COMMODITY_LENGTH:
-                continue
-            if band.overlaps_bbox(word.bbox):
-                found.append(word)
+    found: list[Word] = [
+        word
+        for line in continuation
+        for word in line.words
+        if _is_commodity_token(word, band)
+    ]
     if not found:
         return None
     # Pick the rightmost qualifying token — the BoM template prints the
@@ -518,6 +707,13 @@ def _collect_part_text(
     ``mfg_part_band.width * SUPPLIER_PART_GAP_RATIO`` (default 0.3)
     so the limit scales with the document's own column sizing — no
     hardcoded points, generalises across BoM templates.
+
+    The walk also drops a *trailing packaging/quantity* parenthetical —
+    ``(PACK OF 5)`` in ``53525K17 (PACK OF 5)`` — which is a note, not part of
+    the MPN; left in, it yields a noisy multi-word part the scorer rejects,
+    dropping an otherwise-valid supplier row. Other parentheticals are kept:
+    length suffixes like ``(36)`` / ``(24)`` on extrusion part numbers
+    (``1010-S (36)``) are meaningful and preserved.
     """
     max_gap = mfg_part_band.width * SUPPLIER_PART_GAP_RATIO
     rightward = sorted(
@@ -526,12 +722,36 @@ def _collect_part_text(
     )
     collected: list[Word] = []
     prev_x1: float | None = None
-    for word in rightward:
+    index = 0
+    while index < len(rightward):
+        word = rightward[index]
         if prev_x1 is not None and (word.bbox.x0 - prev_x1) > max_gap:
             break
+        if word.text.startswith("("):
+            group = _parenthetical_group(rightward, index)
+            group_text = " ".join(w.text for w in group)
+            if _PACKAGING_ANNOTATION.match(group_text) is not None:
+                break  # drop the packaging note and everything after it
+            collected.extend(group)
+            prev_x1 = group[-1].bbox.x1
+            index += len(group)
+            continue
         collected.append(word)
         prev_x1 = word.bbox.x1
-    return " ".join(w.text for w in collected).strip()
+        index += 1
+    return _strip_part_label(" ".join(w.text for w in collected).strip())
+
+
+def _parenthetical_group(words: list[Word], start: int) -> list[Word]:
+    """Return the run of words from the ``(`` at ``start`` through its ``)``.
+
+    If the parenthetical never closes, returns the rest of the words — the
+    caller still classifies that whole tail.
+    """
+    end = start
+    while end < len(words) and not words[end].text.endswith(")"):
+        end += 1
+    return words[start : min(end + 1, len(words))]
 
 
 # ---- small surface area for typing / external use ---- ---------------------

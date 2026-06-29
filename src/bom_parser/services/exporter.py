@@ -40,9 +40,7 @@ from bom_parser.models.records import RawRecord, SupplierRow
 from bom_parser.models.scoring import HeuristicWeights
 from bom_parser.services.heuristic_scorer import score_part_number
 from bom_parser.services.supplier_normalizer import SupplierNormalizer
-from bom_parser.utils.consts import FLAG_TOKEN_PATTERN
-
-_FLAG_TOKEN = regex.compile(FLAG_TOKEN_PATTERN)
+from bom_parser.services.tree_builder import build_part_tree
 
 
 def build_bom_document(
@@ -57,6 +55,13 @@ def build_bom_document(
     """Convert assembled raw records into the final ``BomDocument``."""
     normalizer = SupplierNormalizer(supplier_aliases)
     hard_rejected: list[HardRejectedCandidate] = []
+
+    # Resolve each record's document-order instance and its parent *instance*
+    # (BUG 5/6). ``records`` is already in document order; a depth stack with
+    # the same ``< depth`` rule as ParentTracker yields, for each record, the
+    # index of the nearest shallower preceding record — the specific parent
+    # copy, even when a subassembly is re-exploded under several parents.
+    occurrence_ids, parent_occurrence_ids = _resolve_instance_ids(records)
 
     # First pass: group records by cleaned-description key.
     groups: dict[str, list[RawRecord]] = {}
@@ -78,6 +83,8 @@ def build_bom_document(
             internal_pattern=discovery.pattern,
             weights=weights,
             hard_rejected=hard_rejected,
+            occurrence_ids=occurrence_ids,
+            parent_occurrence_ids=parent_occurrence_ids,
         )
         parts.append(part)
 
@@ -93,10 +100,35 @@ def build_bom_document(
         ),
     )
 
-    return BomDocument(metadata=metadata, parts=parts)
+    # Restructure the flat grouped parts into the nested explosion tree that
+    # BomDocument serializes (parsing logic above is unchanged).
+    return BomDocument(metadata=metadata, parts=build_part_tree(parts))
 
 
 # ---- per-part assembly -----------------------------------------------------
+
+
+def _resolve_instance_ids(
+    records: tuple[RawRecord, ...],
+) -> tuple[dict[int, int], dict[int, int | None]]:
+    """Map each record (by identity) to its document-order occurrence id and
+    its parent record's occurrence id.
+
+    Mirrors ``ParentTracker``'s depth logic but keeps the parent *instance*
+    index rather than just the part number, so re-exploded subassemblies are
+    disambiguated. Keyed by ``id(record)`` — every record object is distinct and
+    held alive by ``records`` for the duration of the export.
+    """
+    occurrence_ids: dict[int, int] = {}
+    parent_occurrence_ids: dict[int, int | None] = {}
+    stack: list[tuple[int, int]] = []  # (depth, occurrence_id)
+    for index, record in enumerate(records):
+        while stack and stack[-1][0] >= record.depth:
+            stack.pop()
+        parent_occurrence_ids[id(record)] = stack[-1][1] if stack else None
+        occurrence_ids[id(record)] = index
+        stack.append((record.depth, index))
+    return occurrence_ids, parent_occurrence_ids
 
 
 def _build_part(
@@ -107,10 +139,14 @@ def _build_part(
     internal_pattern: regex.Pattern[str],
     weights: HeuristicWeights,
     hard_rejected: list[HardRejectedCandidate],
+    occurrence_ids: dict[int, int],
+    parent_occurrence_ids: dict[int, int | None],
 ) -> Part:
+    # Occurrence-sum (not parent-multiplied) — see Part.total_quantity docstring.
     total_quantity = sum(r.quantity or 0.0 for r in records)
     uom = next((r.uom for r in records if r.uom), None)
     commodity = next((r.commodity for r in records if r.commodity), None)
+    description_truncated = any(r.description_truncated for r in records)
 
     internal_parts = list(
         dict.fromkeys(r.internal_part for r in records)
@@ -120,6 +156,8 @@ def _build_part(
             internal_author_part=r.internal_part,
             quantity=r.quantity or 0.0,
             parent_internal_part=r.parent_internal_part,
+            occurrence_id=occurrence_ids[id(r)],
+            parent_occurrence_id=parent_occurrence_ids[id(r)],
         )
         for r in records
     ]
@@ -153,6 +191,7 @@ def _build_part(
         internal_author_parts=internal_parts,
         occurrences=occurrences,
         suppliers=suppliers,
+        description_truncated=description_truncated,
     )
 
 
@@ -204,18 +243,18 @@ def _scored_supplier(
 
 
 def _clean_description(raw: str, commodity: str | None) -> str:
-    """Strip residual flag-column tokens and the commodity from description.
+    """Normalise whitespace and drop a residual commodity token.
 
-    Row assembly already removed depth markers, quantities, and dates.
-    What remains tends to be the real description plus the BoM's flag
-    columns ("U EA 0 N 0 AA A") trailing the data row, and the
-    commodity code on the wrap line — neither belongs in the part's
-    user-facing description.
+    Row assembly now bounds the description to the body region by x-position,
+    so depth markers, quantities, dates, the flag columns ("U EA 0 N 0 AA A"),
+    and the commodity are already excluded. We deliberately do **not** strip
+    short uppercase tokens here: the dimensional separator ``X`` in
+    ``1.35" X 2.75"`` is a legitimate description token, not a flag. The
+    commodity removal below is a belt-and-suspenders no-op on cleanly bounded
+    descriptions.
     """
     pieces: list[str] = []
     for token in raw.split():
-        if _FLAG_TOKEN.match(token):
-            continue
         if commodity is not None and token == commodity:
             continue
         pieces.append(token)

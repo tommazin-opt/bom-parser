@@ -68,11 +68,21 @@ class Occurrence(_Frozen):
     the BoM under different parents — each appearance becomes one
     ``Occurrence`` so consumers can later pivot on internal part number or
     parent assembly without re-parsing the PDF.
+
+    ``occurrence_id`` is the source record's document-order index; it uniquely
+    identifies *this* use even when a subassembly is re-exploded under several
+    parents (same ``internal_author_part``, different ``occurrence_id``).
+    ``parent_occurrence_id`` points at the specific parent *instance* — not just
+    its part number — so the tree builder attaches each re-exploded
+    subassembly's children to the correct copy. Both are internal plumbing:
+    ``Occurrence`` is not serialized (the tree of ``PartNode`` is).
     """
 
     internal_author_part: str
     quantity: float = Field(ge=0.0)
     parent_internal_part: str | None = None
+    occurrence_id: int = -1
+    parent_occurrence_id: int | None = None
 
 
 class HardRejectedCandidate(_Frozen):
@@ -100,10 +110,20 @@ class ParseWarning(_Frozen):
 class Part(_Frozen):
     """A BoM line item grouped by description.
 
-    Multiple BoM rows that share a description collapse into a single
-    ``Part``. ``total_quantity`` sums the quantities across every
-    occurrence so a downstream purchasing pipeline has the rolled-up
-    number directly available.
+    Multiple BoM rows that share a description collapse into a single ``Part``.
+
+    ``total_quantity`` is an **occurrence-sum**: the arithmetic sum of each
+    occurrence's own line quantity, exactly as printed on the BoM row. It is
+    deliberately *not* an effective/exploded quantity — parent quantities are
+    **not** propagated into it (a child appearing twice at line-qty 1 has
+    ``total_quantity`` 2 regardless of its parents' quantities). Consumers that
+    need a purchasing rollup must multiply through the parent chain themselves
+    using the tree.
+
+    ``description_truncated`` is a data-quality flag: the source PDF overprints
+    an effectivity date on the description baseline, and where the text ran into
+    that column its tail was clipped out of the text layer. ``True`` means this
+    description is known to be incomplete (see ``row_assembler._detect_truncation``).
     """
 
     description: str
@@ -113,6 +133,34 @@ class Part(_Frozen):
     internal_author_parts: list[str] = Field(default_factory=list[str])
     occurrences: list[Occurrence] = Field(default_factory=list[Occurrence])
     suppliers: list[Supplier] = Field(default_factory=list[Supplier])
+    description_truncated: bool = False
+
+
+class PartNode(_Frozen):
+    """One node in the assembly explosion tree — a single *use* of a part.
+
+    The serialized output is a hierarchy rather than a flat list: each node
+    carries a part's substantive fields (description, suppliers, ...) plus the
+    quantity of *this* occurrence and a ``children`` list of the parts consumed
+    one level below it. Because a part can be consumed under several parents,
+    it appears once per parent (a full BoM explosion) — ``parent_internal_part``
+    disambiguates which use each node represents.
+
+    The flat ``Part``/``Occurrence`` types above remain the parser's internal
+    assembly representation; ``build_part_tree`` converts a list of ``Part``\\ s
+    into the ``PartNode`` forest that ``BomDocument`` actually serializes.
+    """
+
+    internal_author_part: str
+    description: str
+    quantity: float = Field(ge=0.0)
+    total_quantity: float = Field(ge=0.0)
+    uom: str | None = None
+    commodity: str | None = None
+    parent_internal_part: str | None = None
+    description_truncated: bool = False
+    suppliers: list[Supplier] = Field(default_factory=list[Supplier])
+    children: list["PartNode"] = Field(default_factory=list["PartNode"])
 
 
 class ParseMetadata(_Frozen):
@@ -133,7 +181,17 @@ class ParseMetadata(_Frozen):
 
 
 class BomDocument(_Frozen):
-    """Root output object — the JSON written to disk."""
+    """Root output object — the JSON written to disk.
+
+    ``parts`` is the assembly explosion *tree*: a forest of root ``PartNode``\\ s
+    (the top-level units, plus any orphan whose parent wasn't captured), each
+    nesting its sub-parts under ``children``.
+    """
 
     metadata: ParseMetadata
-    parts: list[Part] = Field(default_factory=list[Part])
+    parts: list[PartNode] = Field(default_factory=list[PartNode])
+
+
+# ``PartNode.children`` is a forward self-reference deferred by
+# ``from __future__ import annotations``; resolve it now that the class exists.
+PartNode.model_rebuild()
