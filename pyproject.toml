@@ -20,6 +20,14 @@ dependencies = [
     "rich>=13.0",
     "structlog>=24.0",
     "pyyaml>=6.0",
+    # SERP enrichment (bom-parser enrich). aiohttp floor is a security pin:
+    # all releases up to 3.14.1 are vulnerable. For the latest, install with
+    # --pre to pick up aiohttp 4.0.0a1.
+    "aiohttp>=3.14.1",
+    "openpyxl>=3.1",
+    # Verify TLS against the OS trust store so HTTPS-inspecting corporate
+    # proxies / antivirus don't break SERP requests with cert errors.
+    "truststore>=0.9",
 ]
 
 [project.optional-dependencies]

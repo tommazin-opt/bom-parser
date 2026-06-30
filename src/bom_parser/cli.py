@@ -13,7 +13,9 @@ emitting JSON. Useful when onboarding a new BoM template.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ from rich.console import Console
 from rich.table import Table
 
 from bom_parser import __version__
+from bom_parser.models.serp import SerpConfig
 from bom_parser.pipeline import parse_bom
 from bom_parser.services.ingestion import ingest
 from bom_parser.services.internal_pattern import discover_internal_pattern
@@ -29,8 +32,19 @@ from bom_parser.services.layout_detector import (
     detect_page_layout,
     load_header_synonyms,
 )
+from bom_parser.services.serp_client import SerpAuthError, run_searches
+from bom_parser.services.serp_exporter import write_workbook
+from bom_parser.services.serp_flattener import flatten, unique_queries
 from bom_parser.services.tree_builder import iter_nodes
-from bom_parser.utils.consts import CONFIG_DIR_NAME, HEADER_SYNONYMS_FILENAME
+from bom_parser.utils.consts import (
+    BRIGHTDATA_TOKEN_ENV,
+    BRIGHTDATA_ZONE_ENV,
+    CONFIG_DIR_NAME,
+    DEFAULT_SERP_CONCURRENCY,
+    DEFAULT_SERP_TOP_N,
+    HEADER_SYNONYMS_FILENAME,
+    JSON_GLOB_PATTERN,
+)
 from bom_parser.utils.discovery import discover_bom_pdfs
 
 app = typer.Typer(
@@ -215,6 +229,114 @@ def summary_cmd(
 
     for root in data.get("parts", []):
         walk(root)
+
+
+@app.command("enrich")
+def enrich_cmd(
+    source: Path = typer.Argument(
+        ...,
+        exists=True,
+        readable=True,
+        help="A parsed BoM JSON file or a directory of them (e.g. ./out).",
+    ),
+    output_dir: Path = typer.Option(
+        ..., "-o", "--output", help="Directory to write the .xlsx file(s) into."
+    ),
+    token: str | None = typer.Option(
+        None,
+        "--token",
+        help=f"Bright Data API token (overrides ${BRIGHTDATA_TOKEN_ENV}).",
+    ),
+    zone: str | None = typer.Option(
+        None,
+        "--zone",
+        help=f"Bright Data SERP zone (overrides ${BRIGHTDATA_ZONE_ENV}).",
+    ),
+    concurrency: int = typer.Option(
+        DEFAULT_SERP_CONCURRENCY,
+        "--concurrency",
+        min=1,
+        help=(
+            "Max concurrent API requests. Keep at or below your Bright Data "
+            "plan's concurrent-request limit to avoid 429s."
+        ),
+    ),
+    top_n: int = typer.Option(
+        DEFAULT_SERP_TOP_N, "--top-n", min=1, help="Organic URLs to capture per query."
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Build queries and report counts without calling the API (no credits spent).",
+    ),
+) -> None:
+    """Search each BoM JSON's supplier parts and write a tree-shaped .xlsx.
+
+    For every supplier part the parser found, two Google queries (raw and
+    normalized supplier name) are sent to Bright Data's SERP API and the top-N
+    organic URLs are recorded. The output spreadsheet preserves the BoM
+    parent-child tree via indentation.
+    """
+    json_files = (
+        sorted(source.glob(JSON_GLOB_PATTERN))
+        if source.is_dir()
+        else [source]
+    )
+    if not json_files:
+        console.print(f"[red]No .json files found under {source}[/red]")
+        raise typer.Exit(code=1)
+
+    # Resolve credentials once (CLI flag wins over env). Only required for a
+    # real run — a --dry-run never touches the API.
+    cfg: SerpConfig | None = None
+    if not dry_run:
+        api_token = token or os.environ.get(BRIGHTDATA_TOKEN_ENV)
+        serp_zone = zone or os.environ.get(BRIGHTDATA_ZONE_ENV)
+        if not api_token or not serp_zone:
+            console.print(
+                f"[red]Missing Bright Data credentials.[/red] Set "
+                f"${BRIGHTDATA_TOKEN_ENV} and ${BRIGHTDATA_ZONE_ENV} (or pass "
+                f"--token/--zone), or use --dry-run to preview queries."
+            )
+            raise typer.Exit(code=1)
+        cfg = SerpConfig(
+            api_token=api_token,
+            zone=serp_zone,
+            max_concurrency=concurrency,
+            top_n=top_n,
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for json_path in json_files:
+        data: dict[str, Any] = json.loads(json_path.read_text(encoding="utf-8"))
+        rows = flatten(data.get("parts", []))
+        queries = unique_queries(rows)
+
+        if dry_run or cfg is None:
+            sample = "; ".join(queries[:3])
+            console.print(
+                f"  {json_path.name}: {len(rows)} rows, "
+                f"{len(queries)} unique queries [dim](dry-run)[/dim]"
+                + (f"\n      e.g. {sample}" if sample else "")
+            )
+            continue
+
+        try:
+            query_results = asyncio.run(run_searches(queries, cfg))
+        except SerpAuthError as exc:
+            console.print(
+                f"[red]Bright Data authentication failed:[/red] {exc}\n"
+                f"Check that ${BRIGHTDATA_TOKEN_ENV} is your account API token "
+                f"(Settings -> API tokens, not the zone password) and that "
+                f"${BRIGHTDATA_ZONE_ENV} matches the zone name exactly."
+            )
+            raise typer.Exit(code=1) from exc
+        target = output_dir / f"{json_path.stem}.xlsx"
+        write_workbook(rows, query_results, target, top_n=top_n)
+        console.print(
+            f"  {json_path.name} -> {target.name}  "
+            f"({len(rows)} rows, {len(queries)} unique queries)"
+        )
 
 
 if __name__ == "__main__":

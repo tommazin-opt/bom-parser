@@ -248,6 +248,75 @@ SUPPLIER_TRAILING_PUNCT: Final[str] = ".,;:!?"
 # the reference docs.
 FLAG_TOKEN_PATTERN: Final[str] = r"^(?:[A-Z]{1,2}|\d)$"
 
+# ---- SERP enrichment (Bright Data Google SERP API) -------------------------
+
+# Names of the environment variables holding the Bright Data credentials.
+# The secrets themselves are NEVER hardcoded — these are only the variable
+# names the CLI reads. If unset (outside --dry-run) the CLI exits with a
+# message telling the operator to set them.
+BRIGHTDATA_TOKEN_ENV: Final[str] = "BRIGHTDATA_API_TOKEN"
+BRIGHTDATA_ZONE_ENV: Final[str] = "BRIGHTDATA_SERP_ZONE"
+
+# Bright Data "Direct API" request endpoint. Posting a Google search URL with
+# ``brd_json=1`` appended returns Bright Data's parsed SERP JSON.
+BRIGHTDATA_DEFAULT_ENDPOINT: Final[str] = "https://api.brightdata.com/request"
+
+# Google search URL template. ``{q}`` is the URL-encoded query; ``brd_json=1``
+# asks Bright Data to return parsed JSON (with an ``organic`` array) rather
+# than raw HTML.
+GOOGLE_SEARCH_URL_TEMPLATE: Final[str] = (
+    "https://www.google.com/search?q={q}&brd_json=1"
+)
+
+# Key under which Bright Data's parsed SERP JSON lists organic results, and
+# the per-result key holding the destination URL.
+SERP_ORGANIC_KEY: Final[str] = "organic"
+SERP_RESULT_LINK_KEY: Final[str] = "link"
+
+# Bright Data signals upstream errors with an outer HTTP 200 but populates
+# these response headers (the real status lands in ``x-brd-status-code``).
+# We inspect them so an auth/zone problem surfaces clearly instead of being
+# swallowed as an "empty body" JSON-decode failure.
+BRD_ERR_CODE_HEADER: Final[str] = "x-brd-err-code"
+BRD_ERR_MSG_HEADER: Final[str] = "x-brd-err-msg"
+BRD_STATUS_CODE_HEADER: Final[str] = "x-brd-status-code"
+
+# Bright Data error code / proxy status that mean the credentials (API token
+# or zone) were rejected. These are not transient — retrying is pointless and
+# the run should abort with the upstream message.
+BRD_AUTH_ERR_CODE: Final[str] = "client_10000"
+BRD_PROXY_AUTH_STATUS: Final[str] = "407"
+
+# Number of top organic result URLs captured per query (URL 1 .. URL 10).
+DEFAULT_SERP_TOP_N: Final[int] = 10
+
+# Default concurrent in-flight requests. Deliberately low: the real ceiling is
+# the Bright Data plan's concurrent-request limit, which we don't know here, so
+# we default safe to avoid 429s. The operator raises it via --concurrency once
+# their plan limit is known.
+DEFAULT_SERP_CONCURRENCY: Final[int] = 4
+
+# Per-request retry budget and timeout. Retries cover timeouts, 429, and 5xx
+# with exponential backoff; on final failure the query yields no URLs rather
+# than aborting the whole run.
+DEFAULT_SERP_MAX_RETRIES: Final[int] = 3
+DEFAULT_SERP_TIMEOUT_S: Final[float] = 30.0
+
+# Base backoff (seconds) for the exponential retry: sleep = base * 2**attempt.
+DEFAULT_SERP_BACKOFF_BASE_S: Final[float] = 1.0
+
+# HTTP status codes that warrant a retry (rate-limited / transient server).
+SERP_RETRYABLE_STATUS: Final[frozenset[int]] = frozenset(
+    [429, 500, 502, 503, 504]
+)
+
+# Glob pattern used to discover parsed BoM JSON files for enrichment.
+JSON_GLOB_PATTERN: Final[str] = "*.json"
+
+# Indentation applied per hierarchy level when rendering the tree in Excel.
+EXCEL_INDENT_SPACES_PER_LEVEL: Final[int] = 4
+
+
 # Running page-footer signature. The BoM prints a footer block at the bottom
 # of every page — "* Current Alternate BOM Code / Bill of Materials -
 # Explosion/Implosion Reports, BOMRPT.RPT Opti Temp Inc SSzot <date> <time>".
