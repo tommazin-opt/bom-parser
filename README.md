@@ -27,6 +27,7 @@ support for a new BoM template is normally a YAML edit, not a code change.
 
 | Document | Read this if… |
 | --- | --- |
+| **[docs/HANDOVER.md](docs/HANDOVER.md)** | You are *taking ownership* of this project and aren't a software engineer. Current status, the inherited backlog, and a step-by-step method for directing changes through Claude Code safely. |
 | **[docs/USER_GUIDE.md](docs/USER_GUIDE.md)** | You want to *run* the tool. No programming knowledge assumed — installation, every command, how to read the output, and how to fix the common problems yourself by editing config files. |
 | **[docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md)** | You want to *change* the tool. Architecture, all seven pipeline stages, the data model, testing, debugging, and step-by-step recipes for the usual modifications. Written for someone early in their software career. |
 

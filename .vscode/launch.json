@@ -1,0 +1,69 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "BoM: parse a PDF",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "bom_parser",
+      "args": ["parse", "${input:pdfPath}", "-o", "${input:outputJson}"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "BoM: inspect a PDF (layout debug)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "bom_parser",
+      "args": ["inspect", "${input:pdfPath}"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "BoM: summary of a parsed JSON",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "bom_parser",
+      "args": ["summary", "${input:jsonPath}"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "BoM: enrich out/ (dry run, no API credits)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "bom_parser",
+      "args": ["enrich", "out", "-o", "out", "--dry-run"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Python: current file",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "pdfPath",
+      "type": "promptString",
+      "description": "Path to a BoM PDF",
+      "default": "../automatic-quotes/Resources/PDFBoMs/UA000456AF Bill of Materials.pdf"
+    },
+    {
+      "id": "outputJson",
+      "type": "promptString",
+      "description": "Where to write the parsed JSON",
+      "default": "out/456.json"
+    },
+    {
+      "id": "jsonPath",
+      "type": "promptString",
+      "description": "Path to a parsed BoM JSON",
+      "default": "out/456.json"
+    }
+  ]
+}
